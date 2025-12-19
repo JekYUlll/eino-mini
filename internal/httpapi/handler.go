@@ -230,6 +230,23 @@ func (s *Server) askStream(w http.ResponseWriter, r *http.Request) {
 	}
 	defer stream.Close()
 
+	const flushEvery = 50 * time.Millisecond
+	lastFlush := time.Now()
+	var deltaBuilder strings.Builder
+
+	flushDelta := func(force bool) {
+		if deltaBuilder.Len() == 0 {
+			return
+		}
+		if !force && time.Since(lastFlush) < flushEvery {
+			return
+		}
+		_ = writeSSE(w, "delta", map[string]string{"delta": deltaBuilder.String()})
+		flusher.Flush()
+		deltaBuilder.Reset()
+		lastFlush = time.Now()
+	}
+
 	var answerBuilder strings.Builder
 	for {
 		msg, err := stream.Recv()
@@ -246,9 +263,11 @@ func (s *Server) askStream(w http.ResponseWriter, r *http.Request) {
 		}
 
 		answerBuilder.WriteString(msg.Content)
-		_ = writeSSE(w, "delta", map[string]string{"delta": msg.Content})
-		flusher.Flush()
+		deltaBuilder.WriteString(msg.Content)
+		flushDelta(false)
 	}
+
+	flushDelta(true)
 
 	answer := answerBuilder.String()
 	if answer != "" {
