@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -61,6 +62,14 @@ func (s *Store) NewConversationID() string {
 
 func (s *Store) key(id string) string {
 	return "chat_session:" + id
+}
+
+func (s *Store) systemPrompt() string {
+	prompt := strings.TrimSpace(os.Getenv("CHAT_SYSTEM_PROMPT"))
+	if prompt == "" {
+		return "你是一个后端助手，回答简洁、工程化。"
+	}
+	return prompt
 }
 
 func (s *Store) Load(ctx context.Context, id string) ([]Message, error) {

@@ -25,7 +25,7 @@ func (s *Store) AppendUser(ctx context.Context, convID string, userContent strin
 	if len(history) == 0 {
 		history = append(history, Message{
 			Role:    "system",
-			Content: "你是一个后端助手，回答简洁、工程化。",
+			Content: s.systemPrompt(),
 		})
 	}
 
