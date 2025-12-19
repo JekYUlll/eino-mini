@@ -68,6 +68,7 @@ func (s *Store) Load(ctx context.Context, id string) ([]Message, error) {
 }
 
 // Save 弃用，仅用于调试
+// Save writes the full message list; prefer Update/UpdateWithRetry in normal flows.
 func (s *Store) Save(ctx context.Context, id string, msgs []Message) error {
 	return s.saveMessages(ctx, s.key(id), msgs)
 }

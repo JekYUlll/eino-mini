@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strings"
@@ -30,6 +32,7 @@ type askResp struct {
 func (s *Server) Register(mux *http.ServeMux) {
 	mux.HandleFunc("/healthz", s.healthz)
 	mux.HandleFunc("/ask", s.ask)
+	mux.HandleFunc("/ask/stream", s.askStream)
 }
 
 func (s *Server) healthz(w http.ResponseWriter, r *http.Request) {
@@ -58,8 +61,13 @@ func (s *Server) ask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if s.Store == nil || s.LLM == nil {
+		http.Error(w, "server misconfig", http.StatusInternalServerError)
+		return
+	}
+
 	// 1) convID
-	convID := strings.TrimSpace(req.ConversationID)
+	convID := req.ConversationID
 	if convID == "" {
 		convID = s.Store.NewConversationID()
 	}
@@ -131,4 +139,156 @@ func (s *Server) ask(w http.ResponseWriter, r *http.Request) {
 		ConversationID: convID,
 		Answer:         answer,
 	})
+}
+
+func (s *Server) askStream(w http.ResponseWriter, r *http.Request) {
+	// CORS headers
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	if r.Method != http.MethodPost {
+		http.Error(w, "POST only", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req askReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Question == "" {
+		http.Error(w, "bad json or empty question", http.StatusBadRequest)
+		return
+	}
+
+	if s.Store == nil || s.LLM == nil {
+		http.Error(w, "server misconfig", http.StatusInternalServerError)
+		return
+	}
+
+	convID := req.ConversationID
+	if convID == "" {
+		convID = s.Store.NewConversationID()
+	}
+
+	wait := 8 * time.Second
+	if v := os.Getenv("CHAT_LOCK_WAIT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			wait = d
+		}
+	}
+	deadline := time.Now().Add(wait)
+
+	var token string
+	for {
+		t, ok, err := s.Store.AcquireLock(r.Context(), convID)
+		if err != nil {
+			http.Error(w, "redis lock error: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+		if ok {
+			token = t
+			break
+		}
+
+		if time.Now().After(deadline) {
+			http.Error(w, "conversation is busy, try again", http.StatusTooManyRequests) // 429
+			return
+		}
+
+		time.Sleep(80 * time.Millisecond)
+	}
+	defer func() { _ = s.Store.ReleaseLock(context.Background(), convID, token) }()
+
+	history, userID, err := s.Store.AppendUser(r.Context(), convID, req.Question)
+	if err != nil {
+		http.Error(w, "redis append user error: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	_ = writeSSE(w, "meta", map[string]string{"conversation_id": convID})
+	flusher.Flush()
+
+	stream, err := s.LLM.AskWithHistoryStream(r.Context(), history)
+	if err != nil {
+		_ = writeSSE(w, "error", map[string]string{"error": "llm error: " + err.Error()})
+		flusher.Flush()
+		return
+	}
+	defer stream.Close()
+
+	var answerBuilder strings.Builder
+	for {
+		msg, err := stream.Recv()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			_ = writeSSE(w, "error", map[string]string{"error": "stream error: " + err.Error()})
+			flusher.Flush()
+			return
+		}
+		if msg == nil || msg.Content == "" {
+			continue
+		}
+
+		answerBuilder.WriteString(msg.Content)
+		_ = writeSSE(w, "delta", map[string]string{"delta": msg.Content})
+		flusher.Flush()
+	}
+
+	answer := answerBuilder.String()
+	if answer != "" {
+		const maxRetry = 3
+		for i := 0; i < maxRetry; i++ {
+			err = s.Store.InsertAssistant(r.Context(), convID, userID, answer)
+			if err == nil {
+				break
+			}
+			if err == session.ErrUserPruned {
+				break
+			}
+			if !errors.Is(err, session.ErrConflict) {
+				break
+			}
+		}
+		if err != nil && err != session.ErrUserPruned {
+			_ = writeSSE(w, "error", map[string]string{"error": "redis insert error: " + err.Error()})
+			flusher.Flush()
+			return
+		}
+	}
+
+	_ = writeSSE(w, "done", map[string]string{
+		"answer":          answer,
+		"conversation_id": convID,
+	})
+	flusher.Flush()
+}
+
+func writeSSE(w http.ResponseWriter, event string, data any) error {
+	b, err := json.Marshal(data)
+	if err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "event: %s\n", event); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintf(w, "data: %s\n\n", b); err != nil {
+		return err
+	}
+	return nil
 }

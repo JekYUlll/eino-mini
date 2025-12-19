@@ -51,6 +51,21 @@ func (c *Client) Ask(ctx context.Context, question string) (string, error) {
 }
 
 func (c *Client) AskWithHistory(ctx context.Context, history []session.Message) (string, error) {
+	msgs := buildMessages(history)
+
+	resp, err := c.model.Generate(ctx, msgs)
+	if err != nil {
+		return "", err
+	}
+	return resp.Content, nil
+}
+
+func (c *Client) AskWithHistoryStream(ctx context.Context, history []session.Message) (*schema.StreamReader[*schema.Message], error) {
+	msgs := buildMessages(history)
+	return c.model.Stream(ctx, msgs)
+}
+
+func buildMessages(history []session.Message) []*schema.Message {
 	msgs := make([]*schema.Message, 0, len(history))
 	for _, m := range history {
 		role := strings.ToLower(m.Role)
@@ -63,10 +78,5 @@ func (c *Client) AskWithHistory(ctx context.Context, history []session.Message) 
 			Content: m.Content,
 		})
 	}
-
-	resp, err := c.model.Generate(ctx, msgs)
-	if err != nil {
-		return "", err
-	}
-	return resp.Content, nil
+	return msgs
 }

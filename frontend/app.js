@@ -1,6 +1,7 @@
 // Single, clean frontend controller for Eino
 const STORAGE_KEY = 'eino_conversations_v1';
 const API_BASE = window.API_BASE || 'http://localhost:8080';
+const STREAM_ENABLED = window.ENABLE_STREAM !== false;
 
 function uid(){return Math.random().toString(36).slice(2,9)}
 function now(){return new Date().toLocaleString()}
@@ -95,26 +96,17 @@ function renderMessages(){
     conv.conversationId = null
     save(); renderMessages()
   }
-  conv.messages.forEach(m=>{
+  conv.messages.forEach((m, idx)=>{
     const d = document.createElement('div')
     const cls = 'msg '+(m.role==='user'?'user':'assistant') + (m._typing? ' typing':'' )
     d.className = cls
+    d.dataset.idx = String(idx)
     if(m._typing){
       d.innerHTML = `<div class="meta"><strong>Eino</strong> <span class="time">${m.time||''}</span></div><div class="content markdown-content"><div class="dots"><span></span><span></span><span></span></div></div>`
       $messages.appendChild(d)
       return
     }
-    let contentHtml = ''
-    if(m.role === 'assistant' && typeof marked !== 'undefined'){
-      try{
-        const raw = marked.parse(m.content || '')
-        contentHtml = (typeof DOMPurify !== 'undefined') ? DOMPurify.sanitize(raw) : raw
-      }catch(e){
-        contentHtml = escapeHtml(m.content)
-      }
-    }else{
-      contentHtml = escapeHtml(m.content)
-    }
+    const contentHtml = renderContent(m.role, m.content)
     d.innerHTML = `<div class="meta"><strong>${m.role==='user'?'你':'Eino'}</strong> <span class="time">${m.time||''}</span></div><div class="content markdown-content">${contentHtml}</div>`
     $messages.appendChild(d)
   })
@@ -137,6 +129,22 @@ function renderMessages(){
 
 function escapeHtml(s){return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>')}
 
+function renderContent(role, content){
+  if(role === 'assistant' && typeof marked !== 'undefined'){
+    try{
+      const raw = marked.parse(content || '')
+      return (typeof DOMPurify !== 'undefined') ? DOMPurify.sanitize(raw) : raw
+    }catch(e){
+      return escapeHtml(content)
+    }
+  }
+  return escapeHtml(content)
+}
+
+function canStream(){
+  return STREAM_ENABLED && typeof ReadableStream !== 'undefined' && typeof TextDecoder !== 'undefined'
+}
+
 async function sendCurrent(){
   let conv = conversations.find(c=>c.id===currentId)
   if(!conv) { conv = createConversation('对话') }
@@ -155,6 +163,11 @@ async function sendCurrent(){
       save(); renderSidebar()
     }
   }catch(e){/* ignore */}
+
+  if(canStream()){
+    await sendCurrentStream(conv, text)
+    return
+  }
 
   // send to backend /ask with typing indicator
   const placeholder = {role:'assistant', content: '', time: now(), _typing: true}
@@ -181,6 +194,112 @@ async function sendCurrent(){
     if(idx>=0) conv.messages.splice(idx,1)
     const errMsg = {role:'assistant', content: '请求出错：'+err.message, time: now()}
     conv.messages.push(errMsg); save(); renderMessages()
+  } finally {
+    $sendBtn.disabled = false
+  }
+}
+
+async function sendCurrentStream(conv, text){
+  const assistantMsg = {role:'assistant', content:'', time: now(), _streaming: true}
+  conv.messages.push(assistantMsg); renderMessages()
+  $sendBtn.disabled = true
+
+  let buffer = ''
+  let rafId = 0
+  const streamIdx = conv.messages.length - 1
+  const contentEl = ()=>{
+    return $messages.querySelector(`.msg[data-idx="${streamIdx}"] .content`)
+  }
+  const updateStreamContent = ()=>{
+    const el = contentEl()
+    if(!el) return
+    el.innerHTML = renderContent('assistant', assistantMsg.content)
+    $messages.scrollTop = $messages.scrollHeight
+  }
+  const renderMaybe = ()=>{
+    if(rafId) return
+    rafId = requestAnimationFrame(()=>{
+      rafId = 0
+      updateStreamContent()
+    })
+  }
+
+  const handleEvent = (event, payload)=>{
+    if(!payload) return
+    if(event === 'meta'){
+      if(payload.conversation_id) conv.conversationId = payload.conversation_id
+      return
+    }
+    if(event === 'delta'){
+      if(payload.delta){
+        assistantMsg.content += payload.delta
+        renderMaybe()
+      }
+      return
+    }
+    if(event === 'done'){
+      if(payload.conversation_id) conv.conversationId = payload.conversation_id
+      if(payload.answer !== undefined){
+        assistantMsg.content = payload.answer
+      }
+      assistantMsg._streaming = false
+      save(); renderMessages()
+      return
+    }
+    if(event === 'error'){
+      throw new Error(payload.error || 'stream error')
+    }
+  }
+
+  const processBuffer = ()=>{
+    if(buffer.indexOf('\r') !== -1) buffer = buffer.replace(/\r/g,'')
+    let idx = buffer.indexOf('\n\n')
+    while(idx !== -1){
+      const raw = buffer.slice(0, idx)
+      buffer = buffer.slice(idx+2)
+      const lines = raw.split('\n')
+      let event = 'message'
+      const dataLines = []
+      for(const line of lines){
+        if(line.startsWith('event:')) event = line.slice(6).trim()
+        else if(line.startsWith('data:')) dataLines.push(line.slice(5).trim())
+      }
+      if(dataLines.length){
+        const dataStr = dataLines.join('\n')
+        try{
+          handleEvent(event, JSON.parse(dataStr))
+        }catch(e){
+          throw e
+        }
+      }
+      idx = buffer.indexOf('\n\n')
+    }
+  }
+
+  try{
+    const payload = {question: text}
+    if(conv.conversationId) payload.conversation_id = conv.conversationId
+    const res = await fetch(API_BASE + '/ask/stream', {method:'POST',headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)})
+    if(!res.ok) throw new Error('请求失败 '+res.status)
+    if(!res.body) throw new Error('stream not supported')
+
+    const reader = res.body.getReader()
+    const decoder = new TextDecoder()
+    while(true){
+      const {value, done} = await reader.read()
+      if(done) break
+      buffer += decoder.decode(value, {stream:true})
+      processBuffer()
+    }
+    if(buffer.trim()){
+      processBuffer()
+    }
+    assistantMsg._streaming = false
+    save(); renderMessages()
+  }catch(err){
+    assistantMsg._streaming = false
+    assistantMsg.content = '请求出错：'+err.message
+    save(); renderMessages()
   } finally {
     $sendBtn.disabled = false
   }
