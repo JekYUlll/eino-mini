@@ -1,8 +1,12 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
+	"os"
+	"strings"
+	"time"
 
 	"github.com/JekYUlll/eino-mini/internal/llm"
 	"github.com/JekYUlll/eino-mini/internal/session"
@@ -54,10 +58,43 @@ func (s *Server) ask(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 1) convID
-	convID := req.ConversationID
+	convID := strings.TrimSpace(req.ConversationID)
+	for strings.HasPrefix(convID, "chat_session:") {
+		convID = strings.TrimPrefix(convID, "chat_session:")
+	}
 	if convID == "" {
 		convID = s.Store.NewConversationID()
 	}
+
+	wait := 8 * time.Second
+	if v := os.Getenv("CHAT_LOCK_WAIT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			wait = d
+		}
+	}
+	deadline := time.Now().Add(wait)
+
+	var token string
+	for {
+		t, ok, err := s.Store.AcquireLock(r.Context(), convID)
+		if err != nil {
+			http.Error(w, "redis lock error: "+err.Error(), http.StatusBadGateway)
+			return
+		}
+		if ok {
+			token = t
+			break
+		}
+
+		if time.Now().After(deadline) {
+			http.Error(w, "conversation is busy, try again", http.StatusTooManyRequests) // 429
+			return
+		}
+
+		time.Sleep(80 * time.Millisecond)
+	}
+
+	defer func() { _ = s.Store.ReleaseLock(context.Background(), convID, token) }()
 
 	// 2) Phase 1: 先把 user 原子写入 Redis，拿到快照和 userID
 	history, userID, err := s.Store.AppendUser(r.Context(), convID, req.Question)
