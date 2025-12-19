@@ -123,6 +123,7 @@ func (s *Store) InsertAssistant(ctx context.Context, convID, userID, assistantCo
 	next = append(next, cur[:userIdx+1]...)
 	next = append(next, assist)
 	next = append(next, cur[userIdx+1:]...)
+	next = Prune(next)
 
 	return s.applyPrune(ctx, key, next)
 }
