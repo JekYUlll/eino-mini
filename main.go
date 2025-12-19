@@ -8,6 +8,7 @@ import (
 
 	"github.com/JekYUlll/eino-mini/internal/httpapi"
 	"github.com/JekYUlll/eino-mini/internal/llm"
+	"github.com/JekYUlll/eino-mini/internal/session"
 	"github.com/joho/godotenv"
 )
 
@@ -24,7 +25,15 @@ func main() {
 		log.Fatal(err)
 	}
 
-	s := &httpapi.Server{LLM: llmClient}
+	store, err := session.NewStore()
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	s := &httpapi.Server{
+		LLM:   llmClient,
+		Store: store,
+	}
 	mux := http.NewServeMux()
 	s.Register(mux)
 

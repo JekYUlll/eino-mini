@@ -12,16 +12,20 @@ let $convs, $messages, $messagesHeader, $prompt, $sendBtn, $newConvBtn, $clearBt
 
 function load(){
   try{conversations = JSON.parse(localStorage.getItem(STORAGE_KEY)) || []}catch(e){conversations=[]}
+  if(!Array.isArray(conversations)) conversations=[]
+  // add backend conversation id placeholder for older local data
+  conversations = conversations.map(c=>({...c, conversationId: c.conversationId || null}))
   if(conversations.length>0) currentId = conversations[0].id
 }
 
 function save(){localStorage.setItem(STORAGE_KEY, JSON.stringify(conversations))}
 
 function createConversation(title){
-  const c = {id:uid(), title: title||'新对话', created: Date.now(), messages:[]}
+  const c = {id:uid(), title: title||'新对话', created: Date.now(), messages:[], conversationId:null}
   conversations.unshift(c)
   currentId = c.id
   save(); renderSidebar(); renderMessages()
+  return c
 }
 
 function deleteConversation(id){
@@ -88,6 +92,7 @@ function renderMessages(){
     const ok = confirm('确认清空此对话？此操作不可撤销。')
     if(!ok) return
     conv.messages = []
+    conv.conversationId = null
     save(); renderMessages()
   }
   conv.messages.forEach(m=>{
@@ -133,8 +138,8 @@ function renderMessages(){
 function escapeHtml(s){return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/\n/g,'<br>')}
 
 async function sendCurrent(){
-  const conv = conversations.find(c=>c.id===currentId)
-  if(!conv) { createConversation('对话'); return }
+  let conv = conversations.find(c=>c.id===currentId)
+  if(!conv) { conv = createConversation('对话') }
   const text = $prompt.value.trim()
   if(!text) return
   const userMsg = {role:'user', content:text, time: now()}
@@ -157,10 +162,15 @@ async function sendCurrent(){
   $sendBtn.disabled = true
   try{
     const payload = {question: text}
+    if(conv.conversationId) payload.conversation_id = conv.conversationId
     const res = await fetch(API_BASE + '/ask', {method:'POST',headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)})
     if(!res.ok) throw new Error('请求失败 '+res.status)
     const data = await res.json()
     const reply = data.answer || data.reply || data.text || JSON.stringify(data)
+    const backendConvId = data.conversation_id || data.conversationId || data.ConversationID
+    if(backendConvId){
+      conv.conversationId = backendConvId
+    }
     const idx = conv.messages.findIndex(m=>m._typing)
     if(idx>=0) conv.messages.splice(idx,1)
     const assistantMsg = {role:'assistant', content: reply, time: now()}
@@ -198,6 +208,7 @@ document.addEventListener('DOMContentLoaded', ()=>{
     const ok = confirm('确认清空当前对话？此操作不可撤销。')
     if(!ok) return;
     conv.messages = [];
+    conv.conversationId = null;
     save(); renderMessages()
   })
   if($convSearch) $convSearch.addEventListener('input', ()=>renderSidebar())
