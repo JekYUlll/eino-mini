@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Eino — AI Chat (Frontend)</title>
+  <link rel="stylesheet" href="style.css">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+  <meta name="theme-color" content="#0f1216" />
+</head>
+<body>
+  <div class="app">
+    <aside class="sidebar">
+      <header class="sb-header">
+        <div class="brand">
+          <div class="logo">
+            <img src="assets/logo.svg" alt="Eino" class="logo-img" />
+          </div>
+          <div>
+            <h1>Eino</h1>
+          </div>
+        </div>
+        <button id="newConvBtn" title="新对话">＋</button>
+      </header>
+      <div class="search-wrap">
+        <input id="convSearch" placeholder="搜索对话" />
+      </div>
+      <div id="conversations" class="conversations"></div>
+      <footer class="sb-footer"></footer>
+    </aside>
+
+    <main class="chat-panel">
+      <div class="panel-top">
+        <div id="messagesHeader" class="messages-header">
+          <div class="mh-left">
+            <div class="mh-avatar"><div class="mh-avatar-initial">E</div></div>
+            <div class="mh-text">
+              <div class="mh-title">选择或新建一个对话</div>
+              <div class="mh-sub">暂无对话</div>
+            </div>
+          </div>
+          <div class="mh-actions">
+            <button id="renameConvBtn" title="重命名对话">✎</button>
+            <button id="clearConvBtn" title="清空当前对话">🗑</button>
+          </div>
+        </div>
+        <div class="panel-actions"><button id="clearBtn" title="清空当前对话">清空</button></div>
+      </div>
+      <div id="messages" class="messages"></div>
+      <form id="inputForm" class="input-form">
+        <textarea id="prompt" placeholder="输入你的问题，按 Ctrl+Enter 发送" rows="2"></textarea>
+        <div class="controls">
+          <button type="button" id="sendBtn">发送</button>
+        </div>
+      </form>
+    </main>
+  </div>
+
+  <script src="vendor/marked.min.js"></script>
+  <script src="vendor/dompurify.min.js"></script>
+  <div id="errOverlay" style="display:none;position:fixed;left:10px;right:10px;bottom:10px;padding:12px;background:rgba(255,40,40,0.95);color:#fff;border-radius:8px;z-index:9999;max-height:40vh;overflow:auto;font-family:monospace;white-space:pre-wrap;font-size:13px"></div>
+  <script>
+    window.addEventListener('error', function(e){
+      console.error('Captured error', e.error || e.message || e)
+      const el = document.getElementById('errOverlay')
+      if(el){ el.style.display='block'; el.textContent = (e.error && e.error.stack) || e.message || String(e)
+      }
+    })
+    window.addEventListener('unhandledrejection', function(e){
+      console.error('Unhandled rejection', e.reason)
+      const el = document.getElementById('errOverlay')
+      if(el){ el.style.display='block'; el.textContent = (e.reason && e.reason.stack) || e.reason || String(e.reason)
+      }
+    })
+  </script>
+  <script src="app.js" type="module"></script>
+</body>
+</html>
