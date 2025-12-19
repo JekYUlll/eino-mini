@@ -53,68 +53,40 @@ func (s *Server) ask(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 1) convID
 	convID := req.ConversationID
 	if convID == "" {
 		convID = s.Store.NewConversationID()
 	}
 
-	const maxRetries = 3
-
-	var answer string
-
-	for attempt := 1; attempt <= maxRetries; attempt++ {
-		updated, err := s.Store.Update(r.Context(), convID, func(cur []session.Message) ([]session.Message, error) {
-			history := cur
-			if len(history) == 0 {
-				history = append(history, session.Message{
-					Role:    "system",
-					Content: "你是一个后端助手，回答简洁、工程化。",
-				})
-			}
-
-			// 追加本轮 user
-			history = append(history, session.Message{
-				Role:    "user",
-				Content: req.Question,
-			})
-
-			// 先裁剪，避免把超长上下文送给模型
-			history = session.Prune(history)
-
-			// 调模型（注意：这里在 updater 里调用 LLM，会拉长 WATCH 时间）
-			// 这是最小改动版本，能正确，但吞吐一般。下一步我们会优化成“两阶段提交”。
-			a, llmErr := s.LLM.AskWithHistory(r.Context(), history)
-			if llmErr != nil {
-				return nil, llmErr
-			}
-			answer = a
-
-			// 追加 assistant
-			history = append(history, session.Message{
-				Role:    "assistant",
-				Content: answer,
-			})
-
-			// 再裁剪一次（防止 assistant 太长）
-			history = session.Prune(history)
-
-			return history, nil
-		})
-
-		if err == nil {
-			_ = updated // 你如果想 debug，可以把 updated 返回给客户端
-			break
-		}
-
-		if err == session.ErrConflict && attempt < maxRetries {
-			// 冲突重试
-			continue
-		}
-
-		// 其他错误 / 重试耗尽
-		http.Error(w, "session update error: "+err.Error(), http.StatusBadGateway)
+	// 2) Phase 1: 先把 user 原子写入 Redis，拿到快照和 userID
+	history, userID, err := s.Store.AppendUser(r.Context(), convID, req.Question)
+	if err != nil {
+		http.Error(w, "redis append user error: "+err.Error(), http.StatusBadGateway)
 		return
 	}
+
+	// 3) 调 LLM（事务外）
+	answer, err := s.LLM.AskWithHistory(r.Context(), history)
+	if err != nil {
+		http.Error(w, "llm error: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+
+	// 4) Phase 2: 把 assistant 插回对应 user 后面（带重试）
+	const maxRetry = 3
+	for i := 0; i < maxRetry; i++ {
+		err = s.Store.InsertAssistant(r.Context(), convID, userID, answer)
+		if err == nil {
+			break
+		}
+		// 如果 user 在此期间被 prune 掉了，只能放弃落库（但仍返回答案）
+		if err == session.ErrUserPruned {
+			break
+		}
+	}
+	// 不要因为落库失败就让请求失败（你也可以选择失败）
+	// 这里先走“用户优先”：返回 answer
 
 	w.Header().Set("content-type", "application/json; charset=utf-8")
 	_ = json.NewEncoder(w).Encode(askResp{

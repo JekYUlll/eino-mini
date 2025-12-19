@@ -15,8 +15,10 @@ import (
 var ErrConflict = errors.New("session update conflict, please retry")
 
 type Message struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
+	ID       string `json:"id,omitempty"`
+	ParentID string `json:"parent_id,omitempty"` // assistant 对应的 user id
+	Role     string `json:"role"`
+	Content  string `json:"content"`
 }
 
 type Store struct {
