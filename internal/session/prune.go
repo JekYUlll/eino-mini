@@ -86,3 +86,61 @@ func Prune(msgs []Message) []Message {
 	}
 	return kept
 }
+
+// prunePlan returns whether to keep the leading system message and the tail start index
+// (absolute index in msgs) to keep after trimming.
+func prunePlan(msgs []Message) (bool, int) {
+	if len(msgs) == 0 {
+		return false, 0
+	}
+
+	maxTurns := getIntEnv("CHAT_MAX_TURNS", 10)
+	maxChars := getIntEnv("CHAT_MAX_CHARS", 24000)
+
+	keepSystem := false
+	start := 0
+	if msgs[0].Role == "system" {
+		keepSystem = true
+		start = 1
+	}
+
+	rest := msgs[start:]
+
+	// 2) 轮次裁剪：保留最后 maxTurns 轮
+	turnStarts := make([]int, 0, maxTurns+1)
+	for i := len(rest) - 1; i >= 0; i-- {
+		if rest[i].Role == "user" {
+			turnStarts = append(turnStarts, i)
+			if len(turnStarts) >= maxTurns {
+				break
+			}
+		}
+	}
+	cut := 0
+	if len(turnStarts) >= maxTurns {
+		cut = turnStarts[len(turnStarts)-1]
+	}
+
+	absStart := start + cut
+	kept := rest
+	if cut > 0 && cut < len(rest) {
+		kept = rest[cut:]
+	}
+
+	// 3) 字符数裁剪：从后往前累加，超过就截掉更早的
+	total := 0
+	idx := len(kept)
+	for i := len(kept) - 1; i >= 0; i-- {
+		total += len(kept[i].Content)
+		if total > maxChars {
+			idx = i + 1
+			break
+		}
+	}
+
+	tailStart := absStart
+	if idx < len(kept) {
+		tailStart = absStart + idx
+	}
+	return keepSystem, tailStart
+}

@@ -64,29 +64,12 @@ func (s *Store) key(id string) string {
 }
 
 func (s *Store) Load(ctx context.Context, id string) ([]Message, error) {
-	val, err := s.rdb.Get(ctx, s.key(id)).Bytes()
-	if err == redis.Nil {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-
-	var msgs []Message
-	err = json.Unmarshal(val, &msgs)
-	if err != nil {
-		return nil, err
-	}
-	return msgs, nil
+	return s.loadMessages(ctx, s.key(id))
 }
 
+// Save 弃用，仅用于调试
 func (s *Store) Save(ctx context.Context, id string, msgs []Message) error {
-	b, err := json.Marshal(msgs)
-	if err != nil {
-		return err
-	}
-
-	return s.rdb.Set(ctx, s.key(id), b, s.ttl).Err()
+	return s.saveMessages(ctx, s.key(id), msgs)
 }
 
 // Update: 用 WATCH/MULTI 保证 “读-改-写” 在并发下不会丢更新。
@@ -101,17 +84,9 @@ func (s *Store) Update(
 
 	var out []Message
 	err := s.rdb.Watch(ctx, func(tx *redis.Tx) error {
-		// 1) 读当前值
-		var cur []Message
-		val, err := tx.Get(ctx, key).Result()
-		if err == redis.Nil {
-			cur = nil
-		} else if err != nil {
+		cur, err := s.loadMessagesCtx(ctx, tx, key)
+		if err != nil {
 			return err
-		} else {
-			if err := json.Unmarshal([]byte(val), &cur); err != nil {
-				return err
-			}
 		}
 
 		// 2) 让调用方基于 cur 生成新值
@@ -120,16 +95,9 @@ func (s *Store) Update(
 			return err
 		}
 
-		// 3) 序列化
-		b, err := json.Marshal(next)
-		if err != nil {
-			return err
-		}
-
-		// 4) MULTI/EXEC 提交（带 TTL）
+		// 3) MULTI/EXEC 提交（带 TTL）
 		_, err = tx.TxPipelined(ctx, func(p redis.Pipeliner) error {
-			p.Set(ctx, key, b, s.ttl)
-			return nil
+			return s.writeMessages(ctx, p, key, next)
 		})
 		if err != nil {
 			// 如果 key 在 WATCH 后被别人改过，这里会返回 redis.TxFailedErr
@@ -147,4 +115,101 @@ func (s *Store) Update(
 		return nil, err
 	}
 	return out, nil
+}
+
+// UpdateWithRetry: retry Update on ErrConflict up to n times.
+func (s *Store) UpdateWithRetry(
+	ctx context.Context,
+	id string,
+	n int,
+	updater func(cur []Message) ([]Message, error),
+) ([]Message, error) {
+	var lastErr error
+	for i := 0; i < n; i++ {
+		out, err := s.Update(ctx, id, updater)
+		if err == nil {
+			return out, nil
+		}
+		if errors.Is(err, ErrConflict) {
+			lastErr = err
+			continue
+		}
+		return nil, err
+	}
+	return nil, lastErr
+}
+
+// loadMessages: read all messages stored as a Redis list. Each element is a JSON-encoded Message.
+func (s *Store) loadMessages(ctx context.Context, key string) ([]Message, error) {
+	return s.loadMessagesCtx(ctx, s.rdb, key)
+}
+
+func (s *Store) loadMessagesCtx(ctx context.Context, cmd redis.Cmdable, key string) ([]Message, error) {
+	vals, err := cmd.LRange(ctx, key, 0, -1).Result()
+	if err == redis.Nil {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	msgs := make([]Message, 0, len(vals))
+	for _, v := range vals {
+		var m Message
+		if err := json.Unmarshal([]byte(v), &m); err != nil {
+			return nil, err
+		}
+		msgs = append(msgs, m)
+	}
+	return msgs, nil
+}
+
+func (s *Store) saveMessages(ctx context.Context, key string, msgs []Message) error {
+	_, err := s.rdb.TxPipelined(ctx, func(p redis.Pipeliner) error {
+		return s.writeMessages(ctx, p, key, msgs)
+	})
+	return err
+}
+
+func (s *Store) writeMessages(ctx context.Context, p redis.Pipeliner, key string, msgs []Message) error {
+	p.Del(ctx, key)
+	if len(msgs) > 0 {
+		elems := make([]interface{}, 0, len(msgs))
+		for _, m := range msgs {
+			b, err := json.Marshal(m)
+			if err != nil {
+				return err
+			}
+			elems = append(elems, b)
+		}
+		p.RPush(ctx, key, elems...)
+	}
+	p.Expire(ctx, key, s.ttl)
+	return nil
+}
+
+// applyPrune trims the list to match prune rules using list ops, and refreshes TTL.
+func (s *Store) applyPrune(ctx context.Context, key string, history []Message) error {
+	if len(history) == 0 {
+		return s.rdb.Del(ctx, key).Err()
+	}
+
+	keepSystem, tailStart := prunePlan(history)
+	if tailStart < 0 {
+		tailStart = 0
+	}
+
+	pipe := s.rdb.Pipeline()
+	if tailStart > 0 {
+		pipe.LTrim(ctx, key, int64(tailStart), -1)
+	}
+	if keepSystem && tailStart > 0 {
+		b, err := json.Marshal(history[0])
+		if err != nil {
+			return err
+		}
+		pipe.LPush(ctx, key, b)
+	}
+	pipe.Expire(ctx, key, s.ttl)
+	_, err := pipe.Exec(ctx)
+	return err
 }

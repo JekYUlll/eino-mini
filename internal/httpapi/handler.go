@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"os"
 	"strings"
@@ -59,9 +60,6 @@ func (s *Server) ask(w http.ResponseWriter, r *http.Request) {
 
 	// 1) convID
 	convID := strings.TrimSpace(req.ConversationID)
-	for strings.HasPrefix(convID, "chat_session:") {
-		convID = strings.TrimPrefix(convID, "chat_session:")
-	}
 	if convID == "" {
 		convID = s.Store.NewConversationID()
 	}
@@ -119,6 +117,9 @@ func (s *Server) ask(w http.ResponseWriter, r *http.Request) {
 		}
 		// 如果 user 在此期间被 prune 掉了，只能放弃落库（但仍返回答案）
 		if err == session.ErrUserPruned {
+			break
+		}
+		if !errors.Is(err, session.ErrConflict) {
 			break
 		}
 	}
