@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"strconv"
 	"time"
@@ -10,6 +11,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 )
+
+var ErrConflict = errors.New("session update conflict, please retry")
 
 type Message struct {
 	Role    string `json:"role"`
@@ -82,4 +85,64 @@ func (s *Store) Save(ctx context.Context, id string, msgs []Message) error {
 	}
 
 	return s.rdb.Set(ctx, s.key(id), b, s.ttl).Err()
+}
+
+// Update: 用 WATCH/MULTI 保证 “读-改-写” 在并发下不会丢更新。
+// updater 接收当前 msgs（可能为空），返回更新后的 msgs。
+func (s *Store) Update(
+	ctx context.Context,
+	id string,
+	updater func(cur []Message) ([]Message, error),
+) ([]Message, error) {
+
+	key := s.key(id)
+
+	var out []Message
+	err := s.rdb.Watch(ctx, func(tx *redis.Tx) error {
+		// 1) 读当前值
+		var cur []Message
+		val, err := tx.Get(ctx, key).Result()
+		if err == redis.Nil {
+			cur = nil
+		} else if err != nil {
+			return err
+		} else {
+			if err := json.Unmarshal([]byte(val), &cur); err != nil {
+				return err
+			}
+		}
+
+		// 2) 让调用方基于 cur 生成新值
+		next, err := updater(cur)
+		if err != nil {
+			return err
+		}
+
+		// 3) 序列化
+		b, err := json.Marshal(next)
+		if err != nil {
+			return err
+		}
+
+		// 4) MULTI/EXEC 提交（带 TTL）
+		_, err = tx.TxPipelined(ctx, func(p redis.Pipeliner) error {
+			p.Set(ctx, key, b, s.ttl)
+			return nil
+		})
+		if err != nil {
+			// 如果 key 在 WATCH 后被别人改过，这里会返回 redis.TxFailedErr
+			if errors.Is(err, redis.TxFailedErr) {
+				return ErrConflict
+			}
+			return err
+		}
+
+		out = next
+		return nil
+	}, key)
+
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }

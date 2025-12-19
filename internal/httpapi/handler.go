@@ -58,40 +58,63 @@ func (s *Server) ask(w http.ResponseWriter, r *http.Request) {
 		convID = s.Store.NewConversationID()
 	}
 
-	history, err := s.Store.Load(r.Context(), convID)
-	if err != nil {
-		http.Error(w, "redis load error", http.StatusBadGateway)
-		return
-	}
+	const maxRetries = 3
 
-	// 首次对话：注入 system
-	if len(history) == 0 {
-		history = append(history, session.Message{
-			Role:    "system",
-			Content: "你是一个后端助手，回答简洁、工程化。",
+	var answer string
+
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		updated, err := s.Store.Update(r.Context(), convID, func(cur []session.Message) ([]session.Message, error) {
+			history := cur
+			if len(history) == 0 {
+				history = append(history, session.Message{
+					Role:    "system",
+					Content: "你是一个后端助手，回答简洁、工程化。",
+				})
+			}
+
+			// 追加本轮 user
+			history = append(history, session.Message{
+				Role:    "user",
+				Content: req.Question,
+			})
+
+			// 先裁剪，避免把超长上下文送给模型
+			history = session.Prune(history)
+
+			// 调模型（注意：这里在 updater 里调用 LLM，会拉长 WATCH 时间）
+			// 这是最小改动版本，能正确，但吞吐一般。下一步我们会优化成“两阶段提交”。
+			a, llmErr := s.LLM.AskWithHistory(r.Context(), history)
+			if llmErr != nil {
+				return nil, llmErr
+			}
+			answer = a
+
+			// 追加 assistant
+			history = append(history, session.Message{
+				Role:    "assistant",
+				Content: answer,
+			})
+
+			// 再裁剪一次（防止 assistant 太长）
+			history = session.Prune(history)
+
+			return history, nil
 		})
-	}
 
-	history = append(history, session.Message{
-		Role:    "user",
-		Content: req.Question,
-	})
+		if err == nil {
+			_ = updated // 你如果想 debug，可以把 updated 返回给客户端
+			break
+		}
 
-	answer, err := s.LLM.AskWithHistory(r.Context(), history)
-	if err != nil {
-		http.Error(w, "llm error: "+err.Error(), http.StatusBadGateway)
+		if err == session.ErrConflict && attempt < maxRetries {
+			// 冲突重试
+			continue
+		}
+
+		// 其他错误 / 重试耗尽
+		http.Error(w, "session update error: "+err.Error(), http.StatusBadGateway)
 		return
 	}
-
-	history = append(history, session.Message{
-		Role:    "assistant",
-		Content: answer,
-	})
-
-	// 裁剪
-	history = session.Prune(history)
-	// 存回 Redis（续期 TTL）
-	_ = s.Store.Save(r.Context(), convID, history)
 
 	w.Header().Set("content-type", "application/json; charset=utf-8")
 	_ = json.NewEncoder(w).Encode(askResp{
